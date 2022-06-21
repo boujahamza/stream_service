@@ -9,6 +9,7 @@ WORKDIR /app
 COPY ["package.json", "package-lock.json*", "./"]
 
 RUN npm install --production
+RUN npm install cors
 #RUN npm install typescript
 #RUN npx tsc streamingHandler.ts
 
