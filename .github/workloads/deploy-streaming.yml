@@ -1,0 +1,78 @@
+on: [push]
+
+# Environment variables available to all jobs and steps in this workflow
+env:
+  REGISTRY_NAME: streamio
+  CLUSTER_NAME: streamioCluster
+  CLUSTER_RESOURCE_GROUP: streamio
+  NAMESPACE: default
+  SECRET: streamio-ci
+  APP_NAME: streamio-backend_streaming
+  
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@main
+    
+    - uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+    - name: "Login to ACR"
+      run: |
+        set -euo pipefail
+        # see https://cloudarchitected.com/2021/09/logging-into-acr-in-github-actions/
+        # see https://github.com/Azure/acr/blob/main/docs/AAD-OAuth.md#calling-post-oauth2exchange-to-get-an-acr-refresh-token
+        access_token=$(az account get-access-token --query accessToken -o tsv)
+        refresh_token=$(curl https://${{ env.REGISTRY_NAME }}.azurecr.io/oauth2/exchange -v -d "grant_type=access_token&service=${{ env.REGISTRY_NAME }}.azurecr.io&access_token=$access_token" | jq -r .refresh_token)
+        # The null GUID 0000... tells the container registry that this is an ACR refresh token during the login flow
+        docker login -u 00000000-0000-0000-0000-000000000000 --password-stdin ${{ env.REGISTRY_NAME }}.azurecr.io <<< "$refresh_token"
+
+    # Connect to Azure Container Registry (ACR)
+    #- uses: azure/docker-login@v1
+    #  with:
+    #    login-server: ${{ env.REGISTRY_NAME }}.azurecr.io
+    #    username: ${{ secrets.REGISTRY_USERNAME }} 
+    #    password: ${{ secrets.REGISTRY_PASSWORD }}
+    
+    # Container build and push to a Azure Container Registry (ACR)
+    - run: |
+        docker build . -t ${{ env.REGISTRY_NAME }}.azurecr.io/${{ env.APP_NAME }}:latest
+        docker push ${{ env.REGISTRY_NAME }}.azurecr.io/${{ env.APP_NAME }}:latest
+      working-directory: .
+
+    # Set the target Azure Kubernetes Service (AKS) cluster. 
+    - uses: azure/aks-set-context@v1
+      with:
+        creds: '${{ secrets.AZURE_CREDENTIALS }}'
+        cluster-name: ${{ env.CLUSTER_NAME }}
+        resource-group: ${{ env.CLUSTER_RESOURCE_GROUP }}
+    
+    # Create namespace if doesn't exist
+    - run: |
+        kubectl create namespace ${{ env.NAMESPACE }} --dry-run=client -o json | kubectl apply -f -
+    
+    # Create image pull secret for ACR
+    - uses: azure/k8s-create-secret@v1
+      with:
+        container-registry-url: ${{ env.REGISTRY_NAME }}.azurecr.io
+        container-registry-username: ${{ secrets.REGISTRY_USERNAME }}
+        container-registry-password: ${{ secrets.REGISTRY_PASSWORD }}
+        secret-name: ${{ env.SECRET }}
+        namespace: ${{ env.NAMESPACE }}
+        arguments: --force true
+    
+
+    - run: |
+        kubectl apply -f streaming-secrets.yml
+
+    # Deploy app to AKS
+    - uses: azure/k8s-deploy@v1
+      with:
+        manifests: |
+          ${{ github.workspace }}/streamio-streaming.yml
+        images: |
+          ${{ env.REGISTRY_NAME }}.azurecr.io/${{ env.APP_NAME }}:latest
+        imagepullsecrets: |
+          ${{ env.SECRET }}
+        namespace: ${{ env.NAMESPACE }}
